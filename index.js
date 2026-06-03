@@ -20,10 +20,11 @@ export default {
       const body = await request.json();
 
       const action = body.action || "chat";
-      const userId = body.userId || "default-user";
+      const userId = sanitizeId(body.userId || "default-user");
+      const roomId = sanitizeId(body.roomId || "default-room");
 
       if (action === "reset_memory") {
-        await deleteMemory(env, userId);
+        await deleteMemory(env, userId, roomId);
 
         return jsonResponse({
           ok: true,
@@ -31,53 +32,40 @@ export default {
         });
       }
 
-      const message = body.message || "";
-      const image = body.image || null;
+      const message = String(body.message || "");
+      const file = normalizeFile(body.file || body.image || null);
 
-      if (!message.trim() && !image) {
+      if (!message.trim() && !file) {
         return jsonResponse(
           {
-            error: "Pesan atau gambar tidak boleh kosong."
+            error: "Pesan atau file tidak boleh kosong."
           },
           400
         );
       }
 
-      if (!env.GEMINI_API_KEY) {
-        return jsonResponse(
-          {
-            error: "GEMINI_API_KEY belum disetel di Worker."
-          },
-          500
-        );
-      }
-
-      if (!env.MOCHI_MEMORY) {
-        return jsonResponse(
-          {
-            error: "KV binding MOCHI_MEMORY belum disetel di Worker."
-          },
-          500
-        );
-      }
-
-      const memory = await getMemory(env, userId);
+      const memory = await getMemoryPack(env, userId, roomId);
 
       const answer = await askGemini({
         env,
         message,
-        image,
-        memory
+        file,
+        memory,
+        userId,
+        roomId
       });
 
       const updatedMemory = await updateMemoryWithGemini({
         env,
-        oldMemory: memory,
+        oldGlobalMemory: memory.globalMemory,
+        oldRoomMemory: memory.roomMemory,
         userMessage: message,
-        aiAnswer: answer
+        aiAnswer: answer,
+        file,
+        roomId
       });
 
-      await saveMemory(env, userId, updatedMemory);
+      await saveMemoryPack(env, userId, roomId, updatedMemory);
 
       return jsonResponse({
         ok: true,
@@ -96,51 +84,190 @@ export default {
   }
 };
 
-async function askGemini({ env, message, image, memory }) {
-  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+/* =========================
+   PROMPT UTAMA
+========================= */
 
-  let prompt = "";
+const BASE_PROMPT = `
+Kamu adalah Mochi.
 
-  if (image) {
-    prompt = `
-Kamu adalah Mochi AI Box.
+Mochi adalah asisten AI di dalam proyek Mochi AI Box.
+Nama aplikasinya adalah Mochi AI Box, tapi nama asisten cukup "Mochi".
 
-Memori tentang user:
-${memory || "-"}
+Gaya bicara wajib:
+- Gunakan "aku" untuk diri sendiri.
+- Gunakan "kamu" untuk user.
+- Jangan gunakan "saya".
+- Jangan gunakan "Anda".
+- Jangan terlalu formal.
+- Jangan terlalu template.
+- Jangan terlalu banyak basa-basi.
+- Jawab dengan natural, jelas, dan enak dibaca.
+- Kalau user tampak bingung, jelaskan perlahan dan bertahap.
+- Kalau user minta kode lengkap, berikan kode lengkap, bukan potongan.
+- Kalau user minta perbaikan kode, jelaskan singkat lalu berikan kode yang sudah diperbaiki.
+- Kalau user sedang emosi/frustrasi, jawab lebih tenang dan langsung ke solusi.
+- Jangan sok menggurui.
+- Jangan menambahkan penutup seperti "semoga membantu" kecuali cocok.
+
+Aturan markdown:
+- Boleh gunakan markdown seperlunya.
+- Untuk kode, selalu gunakan fenced code block dengan bahasa yang sesuai.
+- Contoh:
+  \`\`\`html
+  ...
+  \`\`\`
+- Jangan terlalu sering memakai bold.
+- Jangan membuat list panjang jika tidak perlu.
+`.trim();
+
+const OCR_PROMPT = `
+User mengirim gambar.
+
+Tugas utama:
+- Baca teks pada gambar.
+- Jika gambar berisi teks China/Jepang/Korea/Inggris, lakukan OCR.
+- Jika user meminta terjemahan, terjemahkan ke bahasa Indonesia.
+- Kalau user tidak memberi instruksi khusus, baca teks yang terlihat lalu terjemahkan jika memungkinkan.
+
+Format output OCR/terjemahan wajib:
+[Kalimat raw]
+[Kalimat terjemahan]
+
+Contoh:
+您已成功掌握阳神王座，系统正在编写中......
+Kamu telah berhasil menguasai Yang God Throne, sistem sedang menyusun...
+
+Aturan penting:
+- Jangan pakai tabel.
+- Jangan pakai bullet.
+- Jangan pakai nomor.
+- Jangan menulis "Berikut hasil OCR".
+- Jangan menulis "Terjemahan:".
+- Jangan menulis "Teks asli:".
+- Cukup raw lalu terjemahan.
+- Kalau ada banyak kalimat, tulis berurutan.
+- Pisahkan setiap pasangan raw dan terjemahan dengan satu baris kosong jika perlu.
+- Kalau ada teks yang tidak terbaca, tulis singkat: [teks tidak terbaca jelas]
+- Untuk nama orang, romanisasi jika diperlukan.
+- Untuk istilah khusus, pertahankan istilah yang sudah umum atau sesuai konteks.
+- Jangan menerjemahkan terlalu kaku.
+`.trim();
+
+const CODING_FILE_PROMPT = `
+User mengirim file teks/coding.
 
 Tugas:
-- Baca gambar yang dikirim user.
-- Jika gambar berisi teks, lakukan OCR.
-- Jika user meminta terjemahan, terjemahkan ke bahasa Indonesia secara natural.
-- Jika user hanya mengirim gambar tanpa instruksi, jelaskan isi gambar dan tulis teks yang terbaca.
-- Jawab dalam bahasa Indonesia.
-- Jangan terlalu kaku.
-- Jangan terlalu banyak basa-basi.
+- Baca isi file yang dikirim.
+- Pahami instruksi user.
+- Jika user meminta perbaikan, cari bug atau bagian yang perlu diperbaiki.
+- Jika user meminta kode lengkap, berikan kode lengkap yang sudah diperbaiki.
+- Jika user hanya bertanya, jawab sesuai isi file.
 
-Instruksi user:
-${message || "Baca gambar ini dan jelaskan isi/teks yang terlihat."}
+Aturan coding:
+- Jangan hanya memberi potongan kecil jika user meminta kode lengkap.
+- Jika file HTML satu file, berikan satu file HTML lengkap.
+- Jika file JavaScript, berikan JavaScript lengkap yang relevan.
+- Jika ada risiko error, jelaskan singkat sebelum kode.
+- Untuk kode panjang, tetap gunakan fenced code block.
+- Jangan menghapus fitur lama kecuali memang perlu.
+- Jangan mengganti struktur besar tanpa alasan.
 `.trim();
-  } else {
-    prompt = `
-Kamu adalah Mochi AI Box, asisten AI yang menjawab dalam bahasa Indonesia.
 
-Memori tentang user:
-${memory || "-"}
-
-Gaya jawaban:
-- Jelas
-- Natural
-- Ramah
-- Tidak terlalu kaku
-- Jangan terlalu panjang kalau tidak diminta
-- Kalau user meminta kode, berikan kode lengkap jika diperlukan
-- Kalau user sedang membuat aplikasi, jawab bertahap dan mudah diikuti
-- Jangan saya anda, kamu aku sudah cukup. 
-
-Pesan user:
-${message}
+const NORMAL_CHAT_PROMPT = `
+Tugas:
+- Jawab pesan user secara natural.
+- Bantu user sesuai konteks.
+- Kalau konteksnya proyek Mochi AI Box, Cloudflare Worker, Gemini, PWA, KV, markdown, room chat, atau file upload, beri jawaban praktis.
+- Kalau user meminta langkah-langkah, berikan bertahap dan mudah diikuti.
 `.trim();
+
+/* =========================
+   PROMPT MEMORI
+========================= */
+
+const MEMORY_UPDATE_PROMPT = `
+Kamu bertugas memperbarui memori untuk asisten bernama Mochi.
+
+Tujuan memori:
+- Membantu Mochi mengingat konteks proyek user.
+- Membantu Mochi mengikuti gaya jawaban yang user sukai.
+- Membantu Mochi mengingat keputusan teknis yang masih relevan.
+
+Aturan memori:
+- Simpan hanya informasi yang berguna untuk percakapan berikutnya.
+- Simpan preferensi user yang jelas.
+- Simpan proyek yang sedang dibuat user.
+- Simpan konteks teknis penting.
+- Simpan istilah/glosarium hanya jika user jelas membahasnya sebagai preferensi tetap.
+- Jangan simpan hal terlalu sementara.
+- Jangan simpan hal random yang tidak berguna.
+- Jangan simpan API key, token, password, secret, cookie, alamat lengkap, atau data login.
+- Jangan simpan isi file secara penuh.
+- Jangan simpan teks OCR panjang secara penuh.
+- Ringkas, tapi tetap berguna.
+- Gunakan bahasa Indonesia.
+- Gunakan kata "user", bukan "kamu".
+- Jawab hanya JSON valid.
+- Jangan pakai markdown.
+- Jangan pakai penjelasan tambahan.
+
+Format JSON wajib:
+{
+  "globalMemory": "memori umum lintas room, maksimal 1800 karakter",
+  "roomMemory": "memori khusus room ini, maksimal 1800 karakter"
+}
+`.trim();
+
+/* =========================
+   NORMALISASI FILE
+========================= */
+
+function normalizeFile(file) {
+  if (!file) return null;
+
+  if (file.base64 && file.mimeType) {
+    return {
+      kind: "image",
+      name: file.name || "image.jpg",
+      mimeType: file.mimeType,
+      base64: file.base64
+    };
   }
+
+  if (file.kind === "image" && file.base64 && file.mimeType) {
+    return {
+      kind: "image",
+      name: file.name || "image.jpg",
+      mimeType: file.mimeType,
+      base64: file.base64
+    };
+  }
+
+  if (file.kind === "text" && typeof file.text === "string") {
+    return {
+      kind: "text",
+      name: file.name || "file.txt",
+      mimeType: file.mimeType || "text/plain",
+      text: file.text.slice(0, 180000)
+    };
+  }
+
+  return null;
+}
+
+/* =========================
+   GEMINI MAIN
+========================= */
+
+async function askGemini({ env, message, file, memory, userId, roomId }) {
+  const prompt = buildMainPrompt({
+    message,
+    file,
+    memory,
+    userId,
+    roomId
+  });
 
   const parts = [
     {
@@ -148,11 +275,11 @@ ${message}
     }
   ];
 
-  if (image && image.base64 && image.mimeType) {
+  if (file && file.kind === "image" && file.base64 && file.mimeType) {
     parts.push({
       inline_data: {
-        mime_type: image.mimeType,
-        data: image.base64
+        mime_type: file.mimeType,
+        data: file.base64
       }
     });
   }
@@ -165,60 +292,110 @@ ${message}
       }
     ],
     generationConfig: {
-      temperature: 0.6,
+      temperature: file && file.kind === "image" ? 0.35 : 0.65,
       topP: 0.9,
-      maxOutputTokens: 4096
+      maxOutputTokens: 8192
     }
   };
 
-  const geminiUrl =
-    "https://generativelanguage.googleapis.com/v1beta/models/" +
-    model +
-    ":generateContent?key=" +
-    env.GEMINI_API_KEY;
-
-  const geminiRes = await fetch(geminiUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(geminiBody)
-  });
-
-  const geminiData = await geminiRes.json();
-
-  if (!geminiRes.ok) {
-    throw new Error(
-      "Gemini API error: " + JSON.stringify(geminiData, null, 2)
-    );
-  }
-
+  const geminiData = await callGeminiWithFallback(env, geminiBody);
   return extractText(geminiData);
 }
 
-async function updateMemoryWithGemini({ env, oldMemory, userMessage, aiAnswer }) {
-  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+function buildMainPrompt({ message, file, memory, userId, roomId }) {
+  const memorySection = `
+Konteks memori yang boleh dipakai:
+
+Memori global user:
+${memory.globalMemory || "-"}
+
+Memori khusus room ini:
+${memory.roomMemory || "-"}
+
+User ID:
+${userId}
+
+Room ID:
+${roomId}
+`.trim();
+
+  let taskPrompt = NORMAL_CHAT_PROMPT;
+
+  if (file && file.kind === "image") {
+    taskPrompt = OCR_PROMPT;
+  }
+
+  if (file && file.kind === "text") {
+    taskPrompt = `
+${CODING_FILE_PROMPT}
+
+Nama file:
+${file.name}
+
+MIME type:
+${file.mimeType}
+
+Isi file:
+\`\`\`
+${file.text}
+\`\`\`
+`.trim();
+  }
+
+  return `
+${BASE_PROMPT}
+
+${memorySection}
+
+${taskPrompt}
+
+Pesan user:
+${message || (file ? "Tolong proses file ini." : "")}
+`.trim();
+}
+
+/* =========================
+   UPDATE MEMORY
+========================= */
+
+async function updateMemoryWithGemini({
+  env,
+  oldGlobalMemory,
+  oldRoomMemory,
+  userMessage,
+  aiAnswer,
+  file,
+  roomId
+}) {
+  if (!env.MOCHI_MEMORY) {
+    return {
+      globalMemory: oldGlobalMemory || "",
+      roomMemory: oldRoomMemory || ""
+    };
+  }
+
+  const fileInfo = buildMemoryFileInfo(file);
 
   const prompt = `
-Kamu bertugas memperbarui memori singkat untuk asisten AI.
+${MEMORY_UPDATE_PROMPT}
 
-Memori lama:
-${oldMemory || "-"}
+Memori global lama:
+${oldGlobalMemory || "-"}
+
+Memori room lama:
+${oldRoomMemory || "-"}
+
+Room ID:
+${roomId}
 
 Pesan terbaru user:
 ${userMessage || "-"}
 
-Jawaban asisten:
-${aiAnswer || "-"}
+Info file:
+${fileInfo}
 
-Aturan memori:
-- Simpan hanya informasi yang berguna untuk percakapan berikutnya.
-- Jangan simpan hal terlalu sementara.
-- Jangan simpan data sensitif seperti password, API key, token, alamat lengkap, atau informasi pribadi berbahaya.
-- Simpan preferensi user, proyek yang sedang dibuat, gaya jawaban yang disukai, dan konteks teknis yang relevan.
-- Buat ringkas.
-- Maksimal 1500 karakter.
-- Jawab hanya isi memori baru, tanpa penjelasan tambahan.
+Jawaban Mochi:
+${aiAnswer || "-"}
 `.trim();
 
   const geminiBody = {
@@ -233,66 +410,227 @@ Aturan memori:
       }
     ],
     generationConfig: {
-      temperature: 0.3,
+      temperature: 0.2,
       topP: 0.8,
-      maxOutputTokens: 700
+      maxOutputTokens: 1200
     }
   };
 
-  const geminiUrl =
-    "https://generativelanguage.googleapis.com/v1beta/models/" +
-    model +
-    ":generateContent?key=" +
-    env.GEMINI_API_KEY;
+  try {
+    const data = await callGeminiWithFallback(env, geminiBody);
+    const text = extractText(data);
+    const parsed = parseJsonLoose(text);
 
-  const res = await fetch(geminiUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(geminiBody)
-  });
+    return {
+      globalMemory: String(parsed.globalMemory || oldGlobalMemory || "").slice(0, 1800),
+      roomMemory: String(parsed.roomMemory || oldRoomMemory || "").slice(0, 1800)
+    };
+  } catch (error) {
+    return {
+      globalMemory: oldGlobalMemory || "",
+      roomMemory: oldRoomMemory || ""
+    };
+  }
+}
 
-  const data = await res.json();
+function buildMemoryFileInfo(file) {
+  if (!file) return "-";
 
-  if (!res.ok) {
-    return oldMemory || "";
+  if (file.kind === "image") {
+    return "User mengirim gambar untuk OCR/analisis: " + (file.name || "image");
   }
 
-  const newMemory = extractText(data).trim();
-
-  if (!newMemory || newMemory.length < 3) {
-    return oldMemory || "";
+  if (file.kind === "text") {
+    return [
+      "User mengirim file teks/coding.",
+      "Nama file: " + (file.name || "file.txt"),
+      "MIME type: " + (file.mimeType || "text/plain"),
+      "Panjang karakter: " + String(file.text ? file.text.length : 0)
+    ].join("\n");
   }
 
-  return newMemory.slice(0, 1500);
+  return "-";
 }
 
-async function getMemory(env, userId) {
-  const key = getMemoryKey(userId);
-  const value = await env.MOCHI_MEMORY.get(key);
-  return value || "";
+function parseJsonLoose(text) {
+  const raw = String(text || "").trim();
+
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        return JSON.parse(match[0]);
+      } catch (error2) {
+        return {};
+      }
+    }
+    return {};
+  }
 }
 
-async function saveMemory(env, userId, memory) {
-  const key = getMemoryKey(userId);
-  await env.MOCHI_MEMORY.put(key, memory || "");
+/* =========================
+   GEMINI API KEY RANDOM / FALLBACK
+========================= */
+
+function getGeminiKeys(env) {
+  const raw = env.GEMINI_API_KEYS || env.GEMINI_API_KEY || "";
+
+  return raw
+    .split(",")
+    .map(key => key.trim())
+    .filter(Boolean);
 }
 
-async function deleteMemory(env, userId) {
-  const key = getMemoryKey(userId);
-  await env.MOCHI_MEMORY.delete(key);
+function shuffleArray(array) {
+  const copied = [...array];
+
+  for (let i = copied.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copied[i], copied[j]] = [copied[j], copied[i]];
+  }
+
+  return copied;
 }
 
-function getMemoryKey(userId) {
-  return "memory:" + userId;
+async function callGeminiWithFallback(env, geminiBody) {
+  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+  const keys = getGeminiKeys(env);
+
+  if (!keys.length) {
+    throw new Error("GEMINI_API_KEYS atau GEMINI_API_KEY belum disetel di Worker.");
+  }
+
+  const shuffledKeys = shuffleArray(keys);
+  let lastError = null;
+
+  for (const apiKey of shuffledKeys) {
+    try {
+      const geminiUrl =
+        "https://generativelanguage.googleapis.com/v1beta/models/" +
+        model +
+        ":generateContent?key=" +
+        apiKey;
+
+      const res = await fetch(geminiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(geminiBody)
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        lastError = data;
+
+        const status = res.status;
+        const message = JSON.stringify(data).toLowerCase();
+
+        if (
+          status === 429 ||
+          status === 500 ||
+          status === 502 ||
+          status === 503 ||
+          status === 504 ||
+          message.includes("quota") ||
+          message.includes("rate") ||
+          message.includes("overloaded")
+        ) {
+          continue;
+        }
+
+        throw new Error("Gemini API error: " + JSON.stringify(data, null, 2));
+      }
+
+      return data;
+    } catch (err) {
+      lastError = err;
+      continue;
+    }
+  }
+
+  throw new Error(
+    "Semua Gemini API key gagal. Detail terakhir: " +
+      (
+        lastError?.message ||
+        JSON.stringify(lastError, null, 2)
+      )
+  );
+}
+
+/* =========================
+   KV MEMORY
+========================= */
+
+async function getMemoryPack(env, userId, roomId) {
+  if (!env.MOCHI_MEMORY) {
+    return {
+      globalMemory: "",
+      roomMemory: ""
+    };
+  }
+
+  const globalKey = getGlobalMemoryKey(userId);
+  const roomKey = getRoomMemoryKey(userId, roomId);
+
+  const [globalMemory, roomMemory] = await Promise.all([
+    env.MOCHI_MEMORY.get(globalKey),
+    env.MOCHI_MEMORY.get(roomKey)
+  ]);
+
+  return {
+    globalMemory: globalMemory || "",
+    roomMemory: roomMemory || ""
+  };
+}
+
+async function saveMemoryPack(env, userId, roomId, memory) {
+  if (!env.MOCHI_MEMORY) return;
+
+  const globalKey = getGlobalMemoryKey(userId);
+  const roomKey = getRoomMemoryKey(userId, roomId);
+
+  await Promise.all([
+    env.MOCHI_MEMORY.put(globalKey, memory.globalMemory || ""),
+    env.MOCHI_MEMORY.put(roomKey, memory.roomMemory || "")
+  ]);
+}
+
+async function deleteMemory(env, userId, roomId) {
+  if (!env.MOCHI_MEMORY) return;
+
+  await Promise.all([
+    env.MOCHI_MEMORY.delete(getGlobalMemoryKey(userId)),
+    env.MOCHI_MEMORY.delete(getRoomMemoryKey(userId, roomId))
+  ]);
+}
+
+function getGlobalMemoryKey(userId) {
+  return "memory:global:" + userId;
+}
+
+function getRoomMemoryKey(userId, roomId) {
+  return "memory:room:" + userId + ":" + roomId;
+}
+
+/* =========================
+   UTIL
+========================= */
+
+function sanitizeId(value) {
+  return String(value || "")
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 80);
 }
 
 function extractText(data) {
   const parts = data?.candidates?.[0]?.content?.parts || [];
 
   const text = parts
-    .map((part) => part.text || "")
+    .map(part => part.text || "")
     .filter(Boolean)
     .join("\n")
     .trim();
