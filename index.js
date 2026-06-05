@@ -32,6 +32,64 @@ export default {
         });
       }
 
+      if (action === "get_glossary") {
+        const glossary = await getGlossaryTerms(env, userId);
+
+        return jsonResponse({
+          ok: true,
+          glossary
+        });
+      }
+
+      if (action === "add_glossary") {
+        const source = String(body.source || "").trim();
+        const target = String(body.target || "").trim();
+        const note = String(body.note || "").trim();
+        const category = String(body.category || "general").trim();
+
+        if (!source || !target) {
+          return jsonResponse(
+            {
+              error: "source dan target wajib diisi."
+            },
+            400
+          );
+        }
+
+        await upsertGlossaryTerm(env, {
+          userId,
+          source,
+          target,
+          note,
+          category
+        });
+
+        return jsonResponse({
+          ok: true,
+          text: "Glosarium berhasil disimpan."
+        });
+      }
+
+      if (action === "delete_glossary") {
+        const source = String(body.source || "").trim();
+
+        if (!source) {
+          return jsonResponse(
+            {
+              error: "source wajib diisi."
+            },
+            400
+          );
+        }
+
+        await deleteGlossaryTerm(env, userId, source);
+
+        return jsonResponse({
+          ok: true,
+          text: "Glosarium berhasil dihapus."
+        });
+      }
+
       const message = String(body.message || "");
       const file = normalizeFile(body.file || body.image || null);
 
@@ -44,16 +102,44 @@ export default {
         );
       }
 
+      await ensureRoom(env, userId, roomId, body.roomName || "Room");
+
       const memory = await getMemoryPack(env, userId, roomId);
+      const glossary = await getGlossaryTerms(env, userId);
+      const settings = await getUserSettings(env, userId);
+      const recentMessages = await getRecentMessages(env, userId, roomId, 8);
+
+      await saveChatMessage(env, {
+        userId,
+        roomId,
+        role: "user",
+        content: message || fileToShortContent(file),
+        fileName: file?.name || "",
+        fileKind: file?.kind || ""
+      });
 
       const answer = await askGemini({
         env,
         message,
         file,
         memory,
+        glossary,
+        settings,
+        recentMessages,
         userId,
         roomId
       });
+
+      await saveChatMessage(env, {
+        userId,
+        roomId,
+        role: "assistant",
+        content: answer,
+        fileName: "",
+        fileKind: ""
+      });
+
+      await pruneOldMessages(env, userId, roomId, 100);
 
       const updatedMemory = await updateMemoryWithGemini({
         env,
@@ -150,7 +236,7 @@ Aturan penting:
 - Pisahkan setiap pasangan raw dan terjemahan dengan satu baris kosong jika perlu.
 - Kalau ada teks yang tidak terbaca, tulis singkat: [teks tidak terbaca jelas]
 - Untuk nama orang, romanisasi jika diperlukan.
-- Untuk istilah khusus, pertahankan istilah yang sudah umum atau sesuai konteks.
+- Untuk istilah khusus, ikuti glosarium user.
 - Jangan menerjemahkan terlalu kaku.
 `.trim();
 
@@ -178,7 +264,7 @@ const NORMAL_CHAT_PROMPT = `
 Tugas:
 - Jawab pesan user secara natural.
 - Bantu user sesuai konteks.
-- Kalau konteksnya proyek Mochi AI Box, Cloudflare Worker, Gemini, PWA, KV, markdown, room chat, atau file upload, beri jawaban praktis.
+- Kalau konteksnya proyek Mochi AI Box, Cloudflare Worker, Gemini, PWA, KV, D1, markdown, room chat, glosarium, atau file upload, beri jawaban praktis.
 - Kalau user meminta langkah-langkah, berikan bertahap dan mudah diikuti.
 `.trim();
 
@@ -256,15 +342,42 @@ function normalizeFile(file) {
   return null;
 }
 
+function fileToShortContent(file) {
+  if (!file) return "";
+
+  if (file.kind === "image") {
+    return "[Gambar dikirim: " + (file.name || "image") + "]";
+  }
+
+  if (file.kind === "text") {
+    return "[File dikirim: " + (file.name || "file.txt") + "]";
+  }
+
+  return "[File dikirim]";
+}
+
 /* =========================
    GEMINI MAIN
 ========================= */
 
-async function askGemini({ env, message, file, memory, userId, roomId }) {
+async function askGemini({
+  env,
+  message,
+  file,
+  memory,
+  glossary,
+  settings,
+  recentMessages,
+  userId,
+  roomId
+}) {
   const prompt = buildMainPrompt({
     message,
     file,
     memory,
+    glossary,
+    settings,
+    recentMessages,
     userId,
     roomId
   });
@@ -302,7 +415,16 @@ async function askGemini({ env, message, file, memory, userId, roomId }) {
   return extractText(geminiData);
 }
 
-function buildMainPrompt({ message, file, memory, userId, roomId }) {
+function buildMainPrompt({
+  message,
+  file,
+  memory,
+  glossary,
+  settings,
+  recentMessages,
+  userId,
+  roomId
+}) {
   const memorySection = `
 Konteks memori yang boleh dipakai:
 
@@ -317,6 +439,29 @@ ${userId}
 
 Room ID:
 ${roomId}
+`.trim();
+
+  const glossaryText = glossaryToPromptText(glossary);
+
+  const glossarySection = `
+Glosarium user dari D1:
+${glossaryText || "-"}
+
+Aturan glosarium:
+- Jika user meminta terjemahan, ikuti glosarium ini.
+- Jangan mengganti istilah yang sudah ditetapkan user.
+- Kalau istilah ada dalam tanda 【】, pertahankan tanda 【】 di hasil jika konteksnya terjemahan.
+`.trim();
+
+  const settingsSection = `
+Setting user:
+Response style: ${settings.response_style || "-"}
+Translation style: ${settings.translation_style || "-"}
+`.trim();
+
+  const recentSection = `
+Riwayat chat terakhir di room ini:
+${recentMessagesToPromptText(recentMessages)}
 `.trim();
 
   let taskPrompt = NORMAL_CHAT_PROMPT;
@@ -345,13 +490,44 @@ ${file.text}
   return `
 ${BASE_PROMPT}
 
+${settingsSection}
+
 ${memorySection}
+
+${glossarySection}
+
+${recentSection}
 
 ${taskPrompt}
 
 Pesan user:
 ${message || (file ? "Tolong proses file ini." : "")}
 `.trim();
+}
+
+function glossaryToPromptText(glossary) {
+  if (!Array.isArray(glossary) || !glossary.length) return "";
+
+  return glossary
+    .slice(0, 300)
+    .map(item => {
+      const note = item.note ? " (" + item.note + ")" : "";
+      return item.source + " = " + item.target + note;
+    })
+    .join("\n");
+}
+
+function recentMessagesToPromptText(messages) {
+  if (!Array.isArray(messages) || !messages.length) return "-";
+
+  return messages
+    .slice()
+    .reverse()
+    .map(msg => {
+      const role = msg.role === "assistant" ? "Mochi" : "User";
+      return role + ": " + String(msg.content || "").slice(0, 900);
+    })
+    .join("\n");
 }
 
 /* =========================
@@ -468,6 +644,165 @@ function parseJsonLoose(text) {
     }
     return {};
   }
+}
+
+/* =========================
+   D1: GLOSSARY
+========================= */
+
+async function getGlossaryTerms(env, userId) {
+  if (!env.MOCHI_DB) return [];
+
+  const result = await env.MOCHI_DB.prepare(
+    `
+    select source, target, note, category
+    from glossary_terms
+    where user_id = ?
+    order by category, source
+    limit 500
+    `
+  ).bind(userId).all();
+
+  return result.results || [];
+}
+
+async function upsertGlossaryTerm(env, item) {
+  if (!env.MOCHI_DB) return;
+
+  await env.MOCHI_DB.prepare(
+    `
+    insert into glossary_terms (user_id, source, target, note, category, updated_at)
+    values (?, ?, ?, ?, ?, current_timestamp)
+    on conflict(user_id, source) do update set
+      target = excluded.target,
+      note = excluded.note,
+      category = excluded.category,
+      updated_at = current_timestamp
+    `
+  )
+    .bind(
+      item.userId,
+      item.source,
+      item.target,
+      item.note || "",
+      item.category || "general"
+    )
+    .run();
+}
+
+async function deleteGlossaryTerm(env, userId, source) {
+  if (!env.MOCHI_DB) return;
+
+  await env.MOCHI_DB.prepare(
+    `
+    delete from glossary_terms
+    where user_id = ? and source = ?
+    `
+  ).bind(userId, source).run();
+}
+
+/* =========================
+   D1: CHAT HISTORY
+========================= */
+
+async function saveChatMessage(env, item) {
+  if (!env.MOCHI_DB) return;
+
+  await env.MOCHI_DB.prepare(
+    `
+    insert into chat_messages (user_id, room_id, role, content, file_name, file_kind)
+    values (?, ?, ?, ?, ?, ?)
+    `
+  )
+    .bind(
+      item.userId,
+      item.roomId,
+      item.role,
+      String(item.content || "").slice(0, 120000),
+      item.fileName || "",
+      item.fileKind || ""
+    )
+    .run();
+}
+
+async function getRecentMessages(env, userId, roomId, limit = 8) {
+  if (!env.MOCHI_DB) return [];
+
+  const result = await env.MOCHI_DB.prepare(
+    `
+    select role, content, file_name, file_kind, created_at
+    from chat_messages
+    where user_id = ? and room_id = ?
+    order by created_at desc, id desc
+    limit ?
+    `
+  )
+    .bind(userId, roomId, limit)
+    .all();
+
+  return result.results || [];
+}
+
+async function pruneOldMessages(env, userId, roomId, keep = 100) {
+  if (!env.MOCHI_DB) return;
+
+  await env.MOCHI_DB.prepare(
+    `
+    delete from chat_messages
+    where user_id = ?
+      and room_id = ?
+      and id not in (
+        select id from chat_messages
+        where user_id = ? and room_id = ?
+        order by created_at desc, id desc
+        limit ?
+      )
+    `
+  )
+    .bind(userId, roomId, userId, roomId, keep)
+    .run();
+}
+
+/* =========================
+   D1: ROOMS + SETTINGS
+========================= */
+
+async function ensureRoom(env, userId, roomId, roomName) {
+  if (!env.MOCHI_DB) return;
+
+  await env.MOCHI_DB.prepare(
+    `
+    insert into rooms (id, user_id, name, updated_at)
+    values (?, ?, ?, current_timestamp)
+    on conflict(id) do update set
+      updated_at = current_timestamp
+    `
+  )
+    .bind(roomId, userId, String(roomName || "Room").slice(0, 80))
+    .run();
+}
+
+async function getUserSettings(env, userId) {
+  if (!env.MOCHI_DB) {
+    return {
+      response_style: "",
+      translation_style: ""
+    };
+  }
+
+  const row = await env.MOCHI_DB.prepare(
+    `
+    select response_style, translation_style
+    from user_settings
+    where user_id = ?
+    limit 1
+    `
+  ).bind(userId).first();
+
+  return row || {
+    response_style: "",
+    translation_style: ""
+  };
 }
 
 /* =========================
